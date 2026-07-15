@@ -5,6 +5,28 @@ All notable changes to the OpenAlgo Python Library will be documented in this fi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.3] - 2026-07-15
+
+### New Features
+
+#### WebSocket Feed API - Real-Time Order Updates
+- **`subscribe_orders(on_order_update=None)`**: Account-level real-time order
+  status stream over the existing OpenAlgo WebSocket connection — fills,
+  partial fills, rejections and cancellations pushed by the broker (live
+  mode) or the sandbox engine (analyze mode), for orders from any origin
+  (API, broker app/web, engine square-offs).
+- **`unsubscribe_orders()`**: Stop the order-update stream.
+- **`get_orders()`**: Cached order updates received so far (most recent
+  first, capped at 500).
+- **`[ORDER]` log category**: order updates printed at `verbose=2`.
+- Order-update subscription survives reconnects — replayed automatically
+  after re-authentication, like market-data subscriptions.
+- Message fields use OpenAlgo common order constants (`symbol` in OpenAlgo
+  format, `action`, `pricetype`, `product`, lowercase `order_status`,
+  `rejection_reason` with the broker's full RMS/OMS text).
+- Requires an OpenAlgo server with order-update streaming (the
+  `subscribe_orders` WebSocket action).
+
 ## [1.0.40] - 2025-11-25
 
 ### New Features
