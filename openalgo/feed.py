@@ -82,6 +82,11 @@ class FeedAPI(BaseAPI):
         self.quote_callback = None
         self.quotes_callback = None
         self.depth_callback = None
+        self.order_callback = None
+
+        # Order-update storage: most-recent-first list, capped.
+        self.order_data = []
+        self._orders_subscribed = False
 
         # Auto-reconnect state (private, additive — does not change any
         # existing public attribute or behaviour).
@@ -271,6 +276,14 @@ class FeedAPI(BaseAPI):
             self._log(1, "SUB", f"Replaying {len(instruments)} {mode_name} subscription(s) after reconnect")
             self._send_subscribe_msg(mode, instruments)
 
+        # Replay the account-level order-update subscription too.
+        if getattr(self, "_orders_subscribed", False) and self.ws:
+            self._log(1, "SUB", "Replaying order-update subscription after reconnect")
+            try:
+                self.ws.send(json.dumps({"action": "subscribe_orders"}))
+            except Exception as e:
+                self._log(1, "ERROR", f"Error replaying order subscription: {e}")
+
     def _send_subscribe_msg(self, mode: int, instruments: List[Dict[str, Any]], depth: int = 5) -> bool:
         """
         Send a single bulk subscribe message containing the symbols array.
@@ -349,6 +362,33 @@ class FeedAPI(BaseAPI):
                     self._log(2, "AUTH", f"Full response: {message}")
                 else:
                     self._log(1, "ERROR", f"Authentication failed: {message.get('message', 'Unknown error')}")
+                return
+
+            # Handle order-update subscription responses
+            if message.get("type") in ("subscribe_orders", "unsubscribe_orders"):
+                self._log(1, "SUB", f"Order updates | {message.get('type')} | Status: {message.get('status', '?')}")
+                self._log(2, "SUB", f"Full response: {message}")
+                return
+
+            # Handle real-time order updates (account-level, no symbol subscription)
+            if message.get("type") == "order_update":
+                with self.lock:
+                    self.order_data.insert(0, message)
+                    del self.order_data[500:]  # cap retained history
+
+                self._log(
+                    2,
+                    "ORDER",
+                    f"{message.get('symbol', '?'):<20} | {message.get('order_status', '?'):<10} "
+                    f"| Qty: {message.get('filled_quantity', 0)}/{message.get('quantity', 0)} "
+                    f"| Avg: {message.get('average_price', 0)} | ID: {message.get('orderid', '?')}",
+                )
+
+                if self.order_callback:
+                    try:
+                        self.order_callback(message)
+                    except Exception as e:
+                        self._log(1, "ERROR", f"Order callback error: {str(e)}")
                 return
 
             # Handle subscription response
@@ -796,6 +836,75 @@ class FeedAPI(BaseAPI):
             return False
 
         return self._send_unsubscribe_msg(mode=3, instruments=valid)
+
+    def subscribe_orders(self, on_order_update: Optional[Callable] = None) -> bool:
+        """
+        Subscribe to real-time order updates for the authenticated account.
+
+        Order updates cover asynchronous status changes pushed by the broker
+        (or the sandbox engine in analyze mode) after an order is placed —
+        fills, partial fills, rejections, cancellations. No symbols are
+        involved; this is an account-level stream.
+
+        Args:
+            on_order_update: Callback invoked with each order_update message:
+                {"type": "order_update", "orderid": ..., "symbol": ...,
+                 "exchange": ..., "action": ..., "quantity": ...,
+                 "pricetype": ..., "product": ..., "order_status": ...,
+                 "filled_quantity": ..., "pending_quantity": ...,
+                 "average_price": ..., "rejection_reason": ..., "broker": ...}
+
+        Returns:
+            bool: True if the subscription request was sent successfully
+        """
+        if not self.connected:
+            self._log(1, "ERROR", "Not connected to WebSocket server")
+            return False
+
+        if not self.authenticated:
+            self._log(1, "ERROR", "Not authenticated with WebSocket server")
+            return False
+
+        if on_order_update:
+            self.order_callback = on_order_update
+
+        self._log(1, "SUB", "Subscribing to order updates...")
+        try:
+            self.ws.send(json.dumps({"action": "subscribe_orders"}))
+            self._orders_subscribed = True
+            return True
+        except Exception as e:
+            self._log(1, "ERROR", f"Error sending order subscription: {e}")
+            return False
+
+    def unsubscribe_orders(self) -> bool:
+        """
+        Unsubscribe from real-time order updates.
+
+        Returns:
+            bool: True if the unsubscription request was sent successfully
+        """
+        if not self.connected or not self.authenticated:
+            return False
+
+        self._log(1, "UNSUB", "Unsubscribing from order updates")
+        self._orders_subscribed = False
+        try:
+            self.ws.send(json.dumps({"action": "unsubscribe_orders"}))
+            return True
+        except Exception as e:
+            self._log(1, "ERROR", f"Error sending order unsubscription: {e}")
+            return False
+
+    def get_orders(self) -> Dict[str, Any]:
+        """
+        Get the order updates received so far (most recent first, capped).
+
+        Returns:
+            dict: {"orders": [ {...order_update message...}, ... ]}
+        """
+        with self.lock:
+            return {"orders": list(self.order_data)}
 
     def get_ltp(self, exchange: str = None, symbol: str = None) -> Dict[str, Any]:
         """
