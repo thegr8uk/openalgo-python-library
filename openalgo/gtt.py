@@ -165,7 +165,9 @@ class GTTAPI(BaseAPI):
 
         Notes:
         - last_price is fetched server-side; do not send it.
-        - GTT is not available in analyzer (sandbox) mode - the server answers 501.
+        - In analyzer (sandbox) mode the trigger is placed in the sandbox: the
+          response carries "mode": "analyze" and a GTT-... trigger_id, and it
+          fires against live LTP exactly as it would at the broker.
         """
         payload, error = self._gtt_payload(
             strategy=strategy, trigger_type=trigger_type, symbol=symbol,
@@ -246,12 +248,15 @@ class GTTAPI(BaseAPI):
 
     def gttorderbook(self, **kwargs):
         """
-        List the active GTT triggers for the authenticated user.
+        List the authenticated user's GTT triggers.
 
-        Triggered, cancelled, expired and rejected GTTs are filtered out at the
-        broker layer, so every row returned is one that can still fire.
+        By default only active triggers are returned, the ones that can still
+        fire. Pass status="all" for the history as well (triggered, cancelled,
+        expired, rejected), ordered active first. Needs an OpenAlgo server that
+        accepts the status field; older servers refuse it as an unknown field.
 
         Parameters:
+        - status (str, optional): "active" (default) or "all".
         - **kwargs: Passed through unchanged for future API extensions.
 
         Returns:
