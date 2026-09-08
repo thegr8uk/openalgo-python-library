@@ -5,9 +5,11 @@ OpenAlgo Python Library
 
 from .base import BaseAPI
 from .orders import OrderAPI
+from .gtt import GTTAPI
 from .data import DataAPI
 from .account import AccountAPI
 from .strategy import Strategy
+from .strategy_api import StrategyAPI
 from .feed import FeedAPI
 from .options import OptionsAPI
 from .telegram import TelegramAPI
@@ -25,7 +27,8 @@ from .numba_shim import jit as _jit_shim, prange as _prange, HAS_NUMBA  # noqa: 
 nbjit = _jit_shim
 prange = _prange
 
-class api(OrderAPI, DataAPI, AccountAPI, FeedAPI, OptionsAPI, TelegramAPI, WhatsAppAPI, UtilitiesAPI):
+class api(OrderAPI, GTTAPI, DataAPI, AccountAPI, FeedAPI, OptionsAPI,
+          StrategyAPI, TelegramAPI, WhatsAppAPI, UtilitiesAPI):
     """
     OpenAlgo API client class
     """
@@ -105,7 +108,7 @@ class api(OrderAPI, DataAPI, AccountAPI, FeedAPI, OptionsAPI, TelegramAPI, Whats
         self._reconnect_lock = _threading.Lock()
         self._active_subs = {1: {}, 2: {}, 3: {}}
 
-__version__ = "2.0.3"
+__version__ = "2.0.4"
 
 # Export main components for easy access
 __all__ = ['api', 'Strategy', 'ta', 'nbjit', 'prange', 'HAS_NUMBA']

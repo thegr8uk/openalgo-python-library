@@ -16,22 +16,24 @@ technical-indicator library powered by a Rust core (`openalgo._oaindicators`).
 The public entry point is `openalgo.api`, which composes every REST mixin via
 multiple inheritance and calls `BaseAPI.__init__` once:
 
-    api(OrderAPI, DataAPI, AccountAPI, FeedAPI, OptionsAPI,
-        TelegramAPI, WhatsAppAPI, UtilitiesAPI)
+    api(OrderAPI, GTTAPI, DataAPI, AccountAPI, FeedAPI, OptionsAPI,
+        StrategyAPI, TelegramAPI, WhatsAppAPI, UtilitiesAPI)
 
-`Strategy` (TradingView-style webhook sender) and `ta` (indicators) are separate
-top-level exports.
+`Strategy` (the strategy module's public webhook sender) and `ta` (indicators) are
+separate top-level exports.
 
 | File | Responsibility |
 |------|----------------|
-| `openalgo/base.py` | `BaseAPI`: holds config and the shared pooled `httpx.Client` (`self.client`) plus `close()` / context-manager support |
+| `openalgo/base.py` | `BaseAPI`: holds config and the shared pooled `httpx.Client` (`self.client`), the shared `_post()` request helper, plus `close()` / context-manager support |
 | `openalgo/orders.py` | place / modify / cancel / smart / basket / split orders, order status, positions |
+| `openalgo/gtt.py` | `GTTAPI`: `placegttorder` / `modifygttorder` / `cancelgttorder` / `gttorderbook` (SINGLE and OCO triggers) |
 | `openalgo/data.py` | quotes, depth, history, intervals, symbol/instrument lookups (returns pandas where relevant) |
 | `openalgo/account.py` | funds, holdings, orderbook, tradebook, positionbook, margin, `analyzerstatus` / `analyzertoggle` |
 | `openalgo/options.py` | option-chain and options order helpers |
 | `openalgo/telegram.py`, `openalgo/whatsapp.py` | notification endpoints |
 | `openalgo/utilities.py` | market holidays / timings |
-| `openalgo/strategy.py` | `Strategy`: standalone webhook poster (own pooled client) |
+| `openalgo/strategy.py` | `Strategy`: standalone webhook poster for `/strategy/webhook/<token>` (own pooled client) |
+| `openalgo/strategy_api.py` | `StrategyAPI`: the API-key surface under `/api/v1/strategy/` (list, status, start, stop, close_all, close_leg, runs, orders, events) |
 | `openalgo/feed.py` | `FeedAPI`: WebSocket market-data feed (uses `websocket-client`, not httpx) |
 | `openalgo/indicators/` | `ta` technical indicators (Rust core via `_oaindicators`) |
 
@@ -70,17 +72,29 @@ holidays).
 
 The version string lives in three files and they must stay in sync:
 
-1. `setup.py` — `version="x.y.z"` (source of truth for the build)
-2. `openalgo/__init__.py` — `__version__ = "x.y.z"`
-3. `PKG-INFO` — `Version: x.y.z` (setuptools regenerates this on build, but it is
-   committed, so update it too to keep the repo consistent)
+1. `pyproject.toml`: `version = "x.y.z"` (source of truth: maturin builds the wheel)
+2. `setup.py`: `version="x.y.z"` (legacy setuptools metadata, still committed)
+3. `openalgo/__init__.py`: `__version__ = "x.y.z"`
 
-`setup.cfg` contains no version. After bumping, grep the repo for the old version to
-confirm nothing was missed:
+`setup.cfg` contains no version, and there is no committed `PKG-INFO`. After bumping,
+grep the repo for the old version to confirm nothing was missed:
 
     Grep pattern "x\.y\.z" across the repo
 
+Add the release notes to `CHANGELOG.md` under `## [x.y.z] - YYYY-MM-DD` at the top.
+
 Commit message convention (see git log): `vX.Y.Z: short summary`.
+
+## Releasing to PyPI
+
+Do not upload from a developer machine. `.github/workflows/CI.yml` builds abi3 wheels
+for five targets (linux x86_64 + aarch64, macOS x86_64 + arm64, windows x86_64) plus
+an sdist, and publishes them on a `v*` tag push through PyPI trusted publishing (OIDC,
+no API token). A local `maturin publish` would upload one platform's wheel, and the
+version number cannot be reused afterwards, so macOS and Linux users would be left
+compiling the Rust core from the sdist.
+
+    git tag vX.Y.Z && git push origin vX.Y.Z
 
 ## Running / testing locally
 

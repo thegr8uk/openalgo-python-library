@@ -5,6 +5,91 @@ All notable changes to the OpenAlgo Python Library will be documented in this fi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.4] - 2026-09-08
+
+### New Features
+
+#### GTT (Good Till Triggered) Orders
+- **`placegttorder(...)`**: Place a SINGLE or OCO price trigger that sits with
+  the broker until LTP crosses the level, then places the underlying order.
+  SINGLE takes exactly one of `triggerprice_sl` / `triggerprice_tg`; OCO takes
+  all four of `triggerprice_sl`, `stoploss`, `triggerprice_tg` and `target`,
+  with the stoploss trigger below the target trigger.
+- **`modifygttorder(...)`**: Replace an active trigger's spec. Modify is a full
+  replacement, not a patch, so every field to keep must be sent again.
+- **`cancelgttorder(trigger_id=...)`**: Cancel an active trigger. Cancelling an
+  OCO removes both legs atomically.
+- **`gttorderbook()`**: List active triggers. Triggered, cancelled, expired and
+  rejected GTTs are filtered out at the broker layer.
+- Trigger specs are validated locally before a request leaves the machine: a
+  SINGLE with no trigger or with both, an OCO missing a field or with its
+  stoploss trigger at or above its target trigger, and an unknown
+  `trigger_type` all return `{'status': 'error', 'error_type':
+  'validation_error'}` rather than reaching the broker.
+- GTT numeric fields are sent as JSON numbers, not strings, matching what the
+  server validates. GTT accepts CNC and NRML only; MIS is refused server-side.
+
+#### Strategy Module API (API-key surface)
+Nine methods against `/api/v1/strategy/`, for the multi-leg options strategy
+engine with end-to-end risk management:
+- **`strategylist(status=None, q=None)`**: Strategies this key owns, newest first.
+- **`strategystatus(strategy_id=...)`**: One strategy's full config including
+  legs, plus its current run or `null`.
+- **`strategystart(strategy_id=..., mode=...)`**: Start a batch strategy. `mode`
+  is a required keyword argument with no default, in the SDK as on the server:
+  omitting it is a `TypeError`, never a live order. The value is passed through
+  unnormalised, so a near miss such as `"LIVE"` is refused rather than quietly
+  read as sandbox.
+- **`strategystop(strategy_id=...)`**: Exit every owned position at market. Read
+  `stop_pending` and the per-leg outcomes; an accepted stop is not proof of
+  flatness.
+- **`strategycloseall(strategy_id=...)`**: Same stop mechanics, plus a
+  `close_all_manual` audit event proving an operator asked for the flatten.
+- **`strategycloseleg(strategy_id=..., leg_id=...)`**: Exit one leg; the run
+  continues with the rest.
+- **`strategyruns(strategy_id=..., limit=None)`**: Run history, newest first.
+- **`strategyorders(strategy_id=..., run_id=None)`**: Order history, oldest
+  first, so an entry always precedes its exit.
+- **`strategyevents(strategy_id=..., run_id=None, kind=None, severity=None, limit=None)`**:
+  The append-only risk-event audit trail, newest first.
+
+#### Strategy Webhook Client Revamped
+`Strategy` now speaks the strategy module's webhook protocol:
+- **Batch**: `start(mode)` and `stop()`. `mode` is a required positional
+  argument with no default.
+- **Signal**: `long_entry()`, `long_exit()`, `short_entry()`, `short_exit()`,
+  each naming the leg by `leg_id` or by `symbol` plus `exchange`, and a generic
+  `signal(action, ...)` plus a raw `send(payload)`.
+- **`webhook_token` constructor keyword** alongside the original `webhook_id`,
+  which still works. A missing token is a `ValueError` at construction.
+- **The token is never rendered.** `repr()` redacts it, because the token is the
+  whole credential and anywhere it is written down is a second copy of it.
+- **Every documented outcome is returned, not raised.** A 200
+  `rejected_dedupe`, a 409 `rejected_cooling_off` and a 403
+  `rejected_live_disabled` all come back as dicts carrying their `result` label
+  and the HTTP `code`, because that label is the contract. Only a transport
+  failure or a non-JSON answer produces a locally-built error dict.
+
+### Breaking Changes
+
+- **`Strategy.strategyorder(symbol, action, position_size)` was removed.** The
+  webhook it posted to no longer exists. It now raises `NotImplementedError`
+  naming the replacements rather than failing at the network. There is no
+  automatic mapping: `BUY` is `long_entry` on a flat leg and `short_exit` on a
+  short one, and guessing which would be guessing at an order. Use
+  `start(mode)` / `stop()` for a batch strategy, or `long_entry()` /
+  `long_exit()` / `short_entry()` / `short_exit()` for a signal strategy.
+
+### Internal
+
+- **`BaseAPI._post(endpoint, payload)`**: one shared pooled-client request
+  helper for the new surfaces. Unlike the older per-mixin `_make_request`, a
+  non-200 answer with a JSON body is returned as-is with `code` attached
+  instead of being flattened into an `HTTP 409: {...}` string - the strategy
+  and GTT surfaces put the actionable detail inside that body (a 409 stop
+  carries `stop_pending` and the per-leg outcomes, a 400 carries a `message`
+  object keyed by field name). Existing methods are untouched.
+
 ## [2.0.3] - 2026-07-15
 
 ### New Features
