@@ -108,7 +108,7 @@ class api(OrderAPI, GTTAPI, DataAPI, AccountAPI, FeedAPI, OptionsAPI,
         self._reconnect_lock = _threading.Lock()
         self._active_subs = {1: {}, 2: {}, 3: {}}
 
-__version__ = "2.0.4"
+__version__ = "2.0.5"
 
 # Export main components for easy access
 __all__ = ['api', 'Strategy', 'ta', 'nbjit', 'prange', 'HAS_NUMBA']

@@ -7,6 +7,14 @@ Single seam between the Python indicator wrappers and the compiled Rust core
 Rust; when it is absent (a source checkout without a built wheel) a pure-NumPy
 fallback returns the same values. Neither path depends on numba / llvmlite.
 
+That equivalence includes NaN placement, and the two backends once diverged there
+(issue #2029), so the contract is stated explicitly: rolling-window kernels are
+*window-local* - ``out[i]`` is NaN iff ``i < period-1`` or the window contains a
+NaN, recovering as soon as it slides out, the same rule as pandas
+``.rolling(period)``. Recursive kernels (the EMA family) instead skip leading NaNs,
+seed at the first finite value, and carry state across an interior NaN. Both paths
+are checked against each other in ``benchmark/ci_smoke.py``.
+
 Wrappers should call these functions instead of the legacy numba kernels.
 """
 import numpy as np
@@ -24,6 +32,46 @@ def _f(a):
     return np.ascontiguousarray(a, dtype=np.float64)
 
 
+def _first_clean_window(data, period):
+    """Start index of the first NaN-free window of `period` values, else -1.
+
+    Recursive kernels seed here instead of blindly at index 0, so leading warm-up
+    NaNs from an upstream indicator only delay the start of the output.
+    """
+    if period <= 0 or data.size < period:
+        return -1
+    run = 0
+    for i in range(data.size):
+        run = 0 if np.isnan(data[i]) else run + 1
+        if run == period:
+            return i + 1 - period
+    return -1
+
+
+def _roll_nan(data, period, squares=False):
+    """Rolling window sums with NaN treated as absent, plus a per-window NaN count.
+
+    Returns ``(sums, nan_counts)`` (or ``(sums, sum_of_squares, nan_counts)`` when
+    ``squares``), each aligned so element 0 is the window ending at ``period-1``.
+
+    Callers publish a value only where the count is 0. That is the window-local
+    NaN contract the Rust kernels implement (see rust/oa_core "Rolling
+    reductions"): a NaN blanks only the windows containing it and the series
+    recovers once it slides out, the same rule as pandas ``.rolling(period)``.
+    A plain ``np.cumsum`` cannot do this - one NaN poisons every later element.
+    """
+    m = np.isnan(data)
+    clean = np.where(m, 0.0, data)
+    c = np.concatenate(([0.0], np.cumsum(clean)))
+    cm = np.concatenate(([0], np.cumsum(m.astype(np.int64))))
+    sums = c[period:] - c[:-period]
+    counts = cm[period:] - cm[:-period]
+    if not squares:
+        return sums, counts
+    cq = np.concatenate(([0.0], np.cumsum(clean * clean)))
+    return sums, cq[period:] - cq[:-period], counts
+
+
 def sma(data, period):
     data = _f(data)
     period = int(period)
@@ -33,10 +81,8 @@ def sma(data, period):
     out = np.full(n, np.nan)
     if period <= 0 or n < period:
         return out
-    c = np.cumsum(data)
-    out[period - 1] = c[period - 1] / period
-    if n > period:
-        out[period:] = (c[period:] - c[:-period]) / period
+    s, nans = _roll_nan(data, period)
+    out[period - 1:] = np.where(nans == 0, s / period, np.nan)
     return out
 
 
@@ -73,10 +119,10 @@ def hma(data, period):
     sqrt_p = int(np.sqrt(period)) if period > 0 else 0
     if period <= 0 or n < period or half == 0 or sqrt_p == 0:
         return out
-    diff = 2.0 * wma(data, half) - wma(data, period)
-    valid_start = period - 1
-    out[valid_start:] = wma(np.ascontiguousarray(diff[valid_start:]), sqrt_p)
-    return out
+    # `wma` is window-local in NaN, so the outer pass can run over the whole
+    # series: the first valid output still lands at (period-1)+(sqrt_p-1), and a
+    # NaN in `data` only pushes that out locally instead of blanking the tail.
+    return wma(2.0 * wma(data, half) - wma(data, period), sqrt_p)
 
 
 def ema(data, period):
@@ -85,13 +131,17 @@ def ema(data, period):
     if HAVE_RUST:
         return _rs.ema(data, period)
     n = data.size
-    out = np.empty(n)
+    out = np.full(n, np.nan)
     if n == 0:
         return out
     alpha = 2.0 / (period + 1.0)
-    out[0] = data[0]
-    for i in range(1, n):
-        out[i] = alpha * data[i] + (1.0 - alpha) * out[i - 1]
+    prev = np.nan
+    for i in range(n):
+        x = data[i]
+        if np.isnan(x):
+            continue
+        prev = x if np.isnan(prev) else alpha * x + (1.0 - alpha) * prev
+        out[i] = prev
     return out
 
 
@@ -104,18 +154,10 @@ def stdev(data, period):
     out = np.full(n, np.nan)
     if period <= 0 or n < period:
         return out
-    c = np.cumsum(data)
-    csq = np.cumsum(data * data)
-    s = np.empty(n)
-    sq = np.empty(n)
-    s[period - 1] = c[period - 1]
-    sq[period - 1] = csq[period - 1]
-    if n > period:
-        s[period:] = c[period:] - c[:-period]
-        sq[period:] = csq[period:] - csq[:-period]
-    mean = s[period - 1:] / period
-    var = sq[period - 1:] / period - mean * mean
-    out[period - 1:] = np.sqrt(np.maximum(0.0, var))
+    s, sq, nans = _roll_nan(data, period, squares=True)
+    mean = s / period
+    var = sq / period - mean * mean
+    out[period - 1:] = np.where(nans == 0, np.sqrt(np.maximum(0.0, var)), np.nan)
     return out
 
 
@@ -131,7 +173,13 @@ def true_range(high, low, close):
     hl = high[1:] - low[1:]
     hc = np.abs(high[1:] - close[:-1])
     lc = np.abs(low[1:] - close[:-1])
-    tr[1:] = np.maximum(np.maximum(hl, hc), lc)
+    # An unknown bar must stay unknown: `np.maximum` propagates NaN, but be
+    # explicit so this keeps matching the Rust kernel's guard.
+    tr[1:] = np.where(
+        np.isnan(hl) | np.isnan(hc) | np.isnan(lc),
+        np.nan,
+        np.maximum(np.maximum(hl, hc), lc),
+    )
     return tr
 
 
@@ -141,14 +189,13 @@ def atr_wilder(high, low, close, period):
     if HAVE_RUST:
         return _rs.atr_wilder(high, low, close, period)
     n = high.size
-    atr = np.full(n, np.nan)
     if period <= 0 or n < period:
-        return atr
-    tr = true_range(high, low, close)
-    atr[period - 1] = tr[:period].mean()
-    for i in range(period, n):
-        atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
-    return atr
+        return np.full(n, np.nan)
+    # Wilder smoothing of the true range: `ema_wilder` is the same recursion with
+    # the leading-NaN handling already in it, so ATR inherits that rather than
+    # re-seeding blindly at index 0 and poisoning `atr[i - 1]` for the rest of the
+    # series the moment a NaN reaches the true range.
+    return ema_wilder(true_range(high, low, close), period)
 
 
 def rsi(data, period):
@@ -160,13 +207,24 @@ def rsi(data, period):
     out = np.full(n, np.nan)
     if period <= 0 or n < period + 1:
         return out
+    # Seed on the first NaN-free run of period+1 values, matching the Rust kernel.
+    # A NaN delta is neither > 0 nor < 0, so seeding blindly at index 0 folds an
+    # upstream indicator's warm-up into avg_gain == avg_loss == 0 and publishes the
+    # avg_loss == 0 branch: a confident, wrong RSI of 100 over the whole prefix.
+    fv = _first_clean_window(data, period + 1)
+    if fv < 0:
+        return out
     deltas = np.diff(data)
     gains = np.where(deltas > 0, deltas, 0.0)
     losses = np.where(deltas < 0, -deltas, 0.0)
-    avg_gain = gains[:period].mean()
-    avg_loss = losses[:period].mean()
-    out[period] = 100.0 if avg_loss == 0 else 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
-    for i in range(period, n - 1):
+    avg_gain = gains[fv:fv + period].mean()
+    avg_loss = losses[fv:fv + period].mean()
+    start = fv + period
+    out[start] = 100.0 if avg_loss == 0 else 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+    for i in range(start, n - 1):
+        if np.isnan(deltas[i]):
+            # Bar is unknown, not flat: leave NaN and keep the averages intact.
+            continue
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
         out[i + 1] = 100.0 if avg_loss == 0 else 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
@@ -261,11 +319,16 @@ def vwma(data, volume, period):
     out = np.full(n, np.nan)
     if period <= 0 or n < period:
         return out
-    pv = data * volume
-    spv = np.convolve(pv, np.ones(period), "valid")
-    sv = np.convolve(volume, np.ones(period), "valid")
+    # A NaN in either leg blanks only the windows containing it. Masking both
+    # legs (rather than relying on NaN arithmetic) matters because a NaN volume
+    # would make `sv > 0` false and silently take the price fallback branch.
+    bad = np.isnan(data) | np.isnan(volume)
+    ones = np.ones(period)
+    spv = np.convolve(np.where(bad, 0.0, data * volume), ones, "valid")
+    sv = np.convolve(np.where(bad, 0.0, volume), ones, "valid")
+    nans = np.convolve(bad.astype(np.float64), ones, "valid")
     vals = np.where(sv > 0, spv / np.where(sv == 0, 1, sv), data[period - 1:])
-    out[period - 1:] = vals
+    out[period - 1:] = np.where(nans == 0, vals, np.nan)
     return out
 
 
@@ -352,14 +415,10 @@ def ema_wilder(data, period):
     # Skip leading NaNs and seed from the first `period` valid values, matching the
     # Rust kernel (rust/oa_core ema_wilder). Without this, a NaN warm-up prefix
     # (e.g. the dx series inside adx) poisons the seed and the whole output is NaN.
-    first_valid = 0
-    while first_valid < n and np.isnan(data[first_valid]):
-        first_valid += 1
-    if first_valid + period > n:
+    first_valid = _first_clean_window(data, period)
+    if first_valid < 0:
         return out
     seed = data[first_valid:first_valid + period]
-    if np.isnan(seed).any():
-        return out
     start = first_valid + period - 1
     out[start] = seed.sum() / period
     for i in range(start + 1, n):
@@ -552,9 +611,13 @@ def ema_first_valid(data, period):
             break
     if fv == -1:
         return out
+    # Carry the recursion in `prev`, not in `out[i - 1]`: an interior NaN leaves a
+    # NaN in `out` and reading it back would poison every later bar.
+    prev = out[fv]
     for i in range(fv + 1, n):
         if not np.isnan(data[i]):
-            out[i] = alpha * data[i] + (1.0 - alpha) * out[i - 1]
+            prev = alpha * data[i] + (1.0 - alpha) * prev
+            out[i] = prev
     return out
 
 
@@ -625,23 +688,16 @@ def rma_smma(data, length):
     length = int(length)
     n = data.size
     out = np.full(n, np.nan)
-    fv = 0
-    for i in range(n):
+    fv = _first_clean_window(data, length)
+    if fv < 0:
+        return out
+    prev = data[fv:fv + length].sum() / length
+    out[fv + length - 1] = prev
+    alpha = 1.0 / length
+    for i in range(fv + length, n):
         if not np.isnan(data[i]):
-            fv = i
-            break
-    s = 0.0
-    cnt = 0
-    for i in range(fv, min(fv + length, n)):
-        if not np.isnan(data[i]):
-            s += data[i]
-            cnt += 1
-    if cnt == length:
-        out[fv + length - 1] = s / length
-        alpha = 1.0 / length
-        for i in range(fv + length, n):
-            if not np.isnan(data[i]):
-                out[i] = alpha * data[i] + (1.0 - alpha) * out[i - 1]
+            prev = alpha * data[i] + (1.0 - alpha) * prev
+            out[i] = prev
     return out
 
 
@@ -1878,10 +1934,18 @@ def ema_sma(data, period):
     out = np.full(n, np.nan)
     if period <= 0 or n < period:
         return out
+    fv = _first_clean_window(data, period)
+    if fv < 0:
+        return out
     alpha = 2.0 / (period + 1.0)
-    out[period - 1] = data[:period].sum() / period
-    for i in range(period, n):
-        out[i] = alpha * data[i] + (1.0 - alpha) * out[i - 1]
+    start = fv + period - 1
+    prev = data[fv:fv + period].sum() / period
+    out[start] = prev
+    for i in range(start + 1, n):
+        if np.isnan(data[i]):
+            continue
+        prev = alpha * data[i] + (1.0 - alpha) * prev
+        out[i] = prev
     return out
 
 
@@ -1894,10 +1958,8 @@ def rolling_sum(data, period):
     out = np.full(n, np.nan)
     if period <= 0 or n < period:
         return out
-    c = np.cumsum(data)
-    out[period - 1] = c[period - 1]
-    if n > period:
-        out[period:] = c[period:] - c[:-period]
+    s, nans = _roll_nan(data, period)
+    out[period - 1:] = np.where(nans == 0, s, np.nan)
     return out
 
 

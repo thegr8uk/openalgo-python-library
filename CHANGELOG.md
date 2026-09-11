@@ -5,6 +5,70 @@ All notable changes to the OpenAlgo Python Library will be documented in this fi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.5] - 2026-09-11
+
+### Fixed
+
+#### NaN handling in the indicator kernels ([#2029])
+
+Chaining one indicator into another silently produced nothing. Every indicator
+emits warm-up NaNs, and the moving-average kernels let a single NaN into their
+running accumulator, which stayed poisoned for the rest of the series:
+
+```python
+df["RSI_wma"] = ta.rsi(ta.wma(df["close"], 55), 14)
+df["RSI_avg"] = ta.wma(df["RSI_wma"], 9)             # was: NaN on every row
+ta.crossover(df["RSI_wma"], df["RSI_avg"]).sum()     # was: 0 across 1600 bars
+```
+
+`ta.crossover` / `ta.crossunder` were never at fault and are unchanged. Affected
+kernels: `sma`, `wma`, `ema`, `hma`, `zlema`, `t3`, `vwma`, `stdev`,
+`rolling_sum`, `rolling_variance`, `ema_sma`, `ema_wilder`, `ema_first_valid`,
+`true_range`, `atr_wilder` and the rolling extremes behind `stochastic`,
+`williams_r`, `aroon`, `donchian`, `midprice` and `midpoint`.
+
+Three failed silently, returning plausible numbers instead of NaN:
+
+- **`stdev` returned `0.0`** for the rest of the series after a NaN rather than
+  NaN, because `f64::max` returns the *other* operand when one side is NaN and
+  `(NaN).max(0.0).sqrt()` is `0.0`. Bollinger width collapsed to zero instead of
+  failing visibly.
+- **`rsi` returned a flat `100`** across an upstream indicator's warm-up. A NaN
+  delta is neither `> 0` nor `< 0`, so `avg_gain` and `avg_loss` both seeded to 0
+  and the `avg_loss == 0` branch published 100. This one predates the Rust core,
+  which is why pinning back to 1.0.50 did not help.
+- **`median` panicked** through the PyO3 boundary (`partial_cmp().unwrap()`) on
+  any window containing a NaN - a `PanicException`, which is a `BaseException`
+  and so escapes a normal `except Exception`.
+
+`ta.vi` and `ta.ulcerindex` returned all-NaN even on clean OHLCV; both now match
+their textbook definitions.
+
+### Changed
+
+#### The NaN contract is now stated and enforced
+
+Previously unstated, and the two backends had silently drifted apart, so the same
+script gave different answers from a wheel and from a source checkout:
+
+- **Rolling-window kernels are window-local.** `out[i]` is NaN iff `i < period-1`
+  or the window `[i-period+1 .. i]` contains a NaN; the series recovers as soon as
+  the NaN slides out. This is the same rule as pandas `.rolling(period)`.
+- **Recursive kernels (the EMA family) skip leading NaNs**, seed at the first
+  finite value, and carry their state across an interior NaN.
+
+The Rust core and the pure-NumPy fallback are now checked against each other, and
+against pandas, in `benchmark/ci_smoke.py` on every CI run. The Rust core carries
+13 new unit tests for the contract.
+
+**For NaN-free input every other indicator is unchanged, bit for bit** - verified
+across 155 output series against 2.0.4. Performance is at or better than 2.0.4 for
+the hot kernels on 2M rows (`sma` 3.36 -> 2.43 ms, `wma` 3.38 -> 2.62 ms,
+`stdev` 3.53 -> 2.96 ms, `atr` 9.30 -> 8.87 ms); `vwma` is the one regression,
+2.31 -> 3.20 ms.
+
+[#2029]: https://github.com/marketcalls/openalgo/issues/2029
+
 ## [2.0.4] - 2026-09-08
 
 ### New Features

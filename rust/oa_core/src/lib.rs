@@ -8,10 +8,43 @@
 //!
 //! Convention: `f64::NAN` represents the numpy `np.nan` warm-up region. Boolean
 //! kernels return `Vec<bool>` (mapped to numpy bool arrays at the PyO3 layer).
+//!
+//! One deliberate deviation from the legacy kernels: NaN *inside* the input is
+//! handled rather than fed to a running accumulator. See the "Rolling reductions"
+//! header below for the contract, and issue #2029 for why. Values for NaN-free
+//! input are unchanged.
 
 #[inline]
 fn nan_vec(n: usize) -> Vec<f64> {
     vec![f64::NAN; n]
+}
+
+/// NaN -> 0.0, so a NaN can enter a sliding accumulator without poisoning it.
+/// The caller tracks how many NaNs are in the window and withholds the output
+/// until that count is back to zero, at which point the accumulator is exact.
+#[inline]
+fn nan_to_zero(x: f64) -> f64 {
+    if x.is_nan() {
+        0.0
+    } else {
+        x
+    }
+}
+
+/// Start index of the first NaN-free window of `period` values, if any.
+#[inline]
+fn first_clean_window(data: &[f64], period: usize) -> Option<usize> {
+    if period == 0 || data.len() < period {
+        return None;
+    }
+    let mut run = 0usize;
+    for (i, &x) in data.iter().enumerate() {
+        run = if x.is_nan() { 0 } else { run + 1 };
+        if run == period {
+            return Some(i + 1 - period);
+        }
+    }
+    None
 }
 
 #[inline]
@@ -26,6 +59,20 @@ fn max3(a: f64, b: f64, c: f64) -> f64 {
 
 // ============================================================================
 // Rolling reductions
+//
+// NaN contract (see issue #2029). Every rolling-window kernel below is
+// *window-local*: `out[i]` is NaN iff `i < period-1` or the window
+// `[i-period+1 ..= i]` contains a NaN, and the series recovers as soon as the
+// NaN slides out — the same rule as pandas `.rolling(period)`. The O(n)
+// accumulators therefore never take a NaN in (a NaN added to a running sum
+// poisons it for the rest of the series); instead NaNs contribute 0.0 and a
+// running `nans` count decides whether the window is publishable. Because the
+// sliding recurrences are algebraically exact, the accumulator is exact again
+// the moment the window is NaN-free.
+//
+// Recursive kernels (the EMA family) cannot be window-local: they skip leading
+// NaNs, seed at the first finite value, and carry their state across an
+// interior NaN rather than letting it poison the recursion.
 // ============================================================================
 
 /// Simple Moving Average — O(n) rolling sum. NaN for the first `period-1` slots.
@@ -36,14 +83,26 @@ pub fn sma(data: &[f64], period: usize) -> Vec<f64> {
         return result;
     }
     let mut rolling = 0.0;
+    let mut nans = 0usize;
     for &x in data.iter().take(period) {
-        rolling += x;
+        if x.is_nan() {
+            nans += 1;
+        } else {
+            rolling += x;
+        }
     }
-    result[period - 1] = rolling / period as f64;
+    if nans == 0 {
+        result[period - 1] = rolling / period as f64;
+    }
+    let p = period as f64;
     for i in period..n {
+        let new = data[i];
+        let old = data[i - period];
         // Match the reference left-to-right association exactly: (r + new) - old.
-        rolling = rolling + data[i] - data[i - period];
-        result[i] = rolling / period as f64;
+        rolling = rolling + nan_to_zero(new) - nan_to_zero(old);
+        nans += new.is_nan() as usize;
+        nans -= old.is_nan() as usize;
+        result[i] = if nans == 0 { rolling / p } else { f64::NAN };
     }
     result
 }
@@ -56,13 +115,24 @@ pub fn rolling_sum(data: &[f64], period: usize) -> Vec<f64> {
         return result;
     }
     let mut rolling = 0.0;
+    let mut nans = 0usize;
     for &x in data.iter().take(period) {
-        rolling += x;
+        if x.is_nan() {
+            nans += 1;
+        } else {
+            rolling += x;
+        }
     }
-    result[period - 1] = rolling;
+    if nans == 0 {
+        result[period - 1] = rolling;
+    }
     for i in period..n {
-        rolling = rolling + data[i] - data[i - period];
-        result[i] = rolling;
+        let new = data[i];
+        let old = data[i - period];
+        rolling = rolling + nan_to_zero(new) - nan_to_zero(old);
+        nans += new.is_nan() as usize;
+        nans -= old.is_nan() as usize;
+        result[i] = if nans == 0 { rolling } else { f64::NAN };
     }
     result
 }
@@ -77,19 +147,33 @@ pub fn rolling_variance(data: &[f64], period: usize) -> Vec<f64> {
     let p = period as f64;
     let mut rsum = 0.0;
     let mut rsq = 0.0;
+    let mut nans = 0usize;
     for &x in data.iter().take(period) {
-        rsum += x;
-        rsq += x * x;
+        if x.is_nan() {
+            nans += 1;
+        } else {
+            rsum += x;
+            rsq += x * x;
+        }
     }
-    let mean = rsum / p;
-    result[period - 1] = (rsq / p) - mean * mean;
+    if nans == 0 {
+        let mean = rsum / p;
+        result[period - 1] = (rsq / p) - mean * mean;
+    }
     for i in period..n {
         let old = data[i - period];
         let new = data[i];
-        rsum = rsum + new - old;
-        rsq = rsq + new * new - old * old;
+        let (nv, ov) = (nan_to_zero(new), nan_to_zero(old));
+        rsum = rsum + nv - ov;
+        rsq = rsq + nv * nv - ov * ov;
+        nans += new.is_nan() as usize;
+        nans -= old.is_nan() as usize;
         let mean = rsum / p;
-        result[i] = (rsq / p) - mean * mean;
+        result[i] = if nans == 0 {
+            (rsq / p) - mean * mean
+        } else {
+            f64::NAN
+        };
     }
     result
 }
@@ -104,19 +188,36 @@ pub fn stdev(data: &[f64], period: usize) -> Vec<f64> {
     let p = period as f64;
     let mut rsum = 0.0;
     let mut rsq = 0.0;
+    let mut nans = 0usize;
     for &x in data.iter().take(period) {
-        rsum += x;
-        rsq += x * x;
+        if x.is_nan() {
+            nans += 1;
+        } else {
+            rsum += x;
+            rsq += x * x;
+        }
     }
-    let mean = rsum / p;
-    result[period - 1] = (rsq / p - mean * mean).max(0.0).sqrt();
+    if nans == 0 {
+        let mean = rsum / p;
+        result[period - 1] = (rsq / p - mean * mean).max(0.0).sqrt();
+    }
     for i in period..n {
         let old = data[i - period];
         let new = data[i];
-        rsum = rsum + new - old;
-        rsq = rsq + new * new - old * old;
+        let (nv, ov) = (nan_to_zero(new), nan_to_zero(old));
+        rsum = rsum + nv - ov;
+        rsq = rsq + nv * nv - ov * ov;
+        nans += new.is_nan() as usize;
+        nans -= old.is_nan() as usize;
         let mean = rsum / p;
-        result[i] = (rsq / p - mean * mean).max(0.0).sqrt();
+        // `f64::max` returns the *other* operand when one side is NaN, so a
+        // poisoned accumulator used to surface as a silent 0.0 here rather than a
+        // NaN. The `nans` guard is what keeps that from happening.
+        result[i] = if nans == 0 {
+            (rsq / p - mean * mean).max(0.0).sqrt()
+        } else {
+            f64::NAN
+        };
     }
     result
 }
@@ -125,17 +226,33 @@ pub fn stdev(data: &[f64], period: usize) -> Vec<f64> {
 // Moving averages
 // ============================================================================
 
-/// Exponential Moving Average — first-value seed, alpha = 2/(period+1), full length.
+/// Exponential Moving Average — alpha = 2/(period+1), seeded with the first
+/// finite value. Leading NaNs are skipped (they come out NaN); an interior NaN
+/// comes out NaN for that bar only, with the recursion resuming from the last
+/// finite value instead of being poisoned. For NaN-free input this is the
+/// original first-value-seeded, full-length series.
 pub fn ema(data: &[f64], period: usize) -> Vec<f64> {
     let n = data.len();
-    let mut result = vec![0.0f64; n];
+    let mut result = nan_vec(n);
     if n == 0 {
         return result;
     }
     let alpha = 2.0 / (period as f64 + 1.0);
-    result[0] = data[0];
-    for i in 1..n {
-        result[i] = alpha * data[i] + (1.0 - alpha) * result[i - 1];
+    let mut fv = 0usize;
+    while fv < n && data[fv].is_nan() {
+        fv += 1;
+    }
+    if fv == n {
+        return result;
+    }
+    let mut prev = data[fv];
+    result[fv] = prev;
+    for i in fv + 1..n {
+        let x = data[i];
+        if !x.is_nan() {
+            prev = alpha * x + (1.0 - alpha) * prev;
+            result[i] = prev;
+        }
     }
     result
 }
@@ -153,26 +270,44 @@ pub fn wma(data: &[f64], period: usize) -> Vec<f64> {
     // wsum_i = wsum_{i-1} + period*x_new - sum_{i-1}; then slide sum.
     let mut sum = 0.0;
     let mut wsum = 0.0;
+    let mut nans = 0usize;
     for j in 0..period {
-        sum += data[j];
-        wsum += data[j] * (j + 1) as f64;
+        let v = data[j];
+        if v.is_nan() {
+            nans += 1;
+        } else {
+            sum += v;
+            wsum += v * (j + 1) as f64;
+        }
     }
-    result[period - 1] = wsum / weight_sum;
+    if nans == 0 {
+        result[period - 1] = wsum / weight_sum;
+    }
     for i in period..n {
-        wsum = wsum + p * data[i] - sum;
-        sum = sum + data[i] - data[i - period];
-        result[i] = wsum / weight_sum;
+        let new = data[i];
+        let old = data[i - period];
+        let (nv, ov) = (nan_to_zero(new), nan_to_zero(old));
+        wsum = wsum + p * nv - sum;
+        sum = sum + nv - ov;
+        nans += new.is_nan() as usize;
+        nans -= old.is_nan() as usize;
+        result[i] = if nans == 0 {
+            wsum / weight_sum
+        } else {
+            f64::NAN
+        };
     }
     result
 }
 
 /// Hull Moving Average: HMA = WMA(2*WMA(n/2) - WMA(n), sqrt(n)).
 ///
-/// The intermediate `2*WMA(n/2) - WMA(n)` is finite only from index `period-1`
-/// (WMA(n)'s warm-up). The final WMA is run as an inline O(n) rolling pass over
-/// exactly that contiguous valid region, so a NaN never enters the running
-/// accumulators (which, once poisoned, would stay NaN forever and blank the whole
-/// output). First valid output is at `(period-1) + (sqrt(period)-1)`.
+/// The final WMA is an inline O(n) rolling pass over `2*WMA(n/2) - WMA(n)` (no
+/// intermediate allocation), window-local in exactly the way `wma` is: the
+/// accumulators take 0.0 in place of a NaN and `nans` withholds the output until
+/// the window is clean again. For NaN-free input the first valid output is at
+/// `(period-1) + (sqrt(period)-1)`, i.e. WMA(n)'s warm-up plus the outer WMA's;
+/// NaN in the *input* pushes that out window-locally instead of blanking the rest.
 pub fn hma(data: &[f64], period: usize) -> Vec<f64> {
     let n = data.len();
     let mut out = nan_vec(n);
@@ -181,35 +316,39 @@ pub fn hma(data: &[f64], period: usize) -> Vec<f64> {
     }
     let half = period / 2;
     let sqrt_p = (period as f64).sqrt() as usize;
-    if half == 0 || sqrt_p == 0 {
+    if half == 0 || sqrt_p == 0 || n < sqrt_p {
         return out;
     }
     let wh = wma(data, half);
     let wf = wma(data, period);
-    let valid_start = period - 1; // first index where 2*wh - wf is finite
-    if n - valid_start < sqrt_p {
-        return out;
-    }
     let diff = |idx: usize| 2.0 * wh[idx] - wf[idx];
     let weight_sum = (sqrt_p * (sqrt_p + 1) / 2) as f64;
     let sp = sqrt_p as f64;
-    // Seed the first sqrt_p-wide window over diff[valid_start ..= valid_start+sqrt_p-1].
     let mut sum = 0.0;
     let mut wsum = 0.0;
+    let mut nans = 0usize;
     for j in 0..sqrt_p {
-        let v = diff(valid_start + j);
-        sum += v;
-        wsum += v * (j + 1) as f64;
+        let v = diff(j);
+        if v.is_nan() {
+            nans += 1;
+        } else {
+            sum += v;
+            wsum += v * (j + 1) as f64;
+        }
     }
-    let first_out = valid_start + sqrt_p - 1;
-    out[first_out] = wsum / weight_sum;
+    if nans == 0 {
+        out[sqrt_p - 1] = wsum / weight_sum;
+    }
     // Slide: wsum += sqrt_p*x_new - sum; sum += x_new - x_leaving (same as `wma`).
-    for i in first_out + 1..n {
+    for i in sqrt_p..n {
         let v = diff(i);
         let leaving = diff(i - sqrt_p);
-        wsum = wsum + sp * v - sum;
-        sum = sum + v - leaving;
-        out[i] = wsum / weight_sum;
+        let (nv, lv) = (nan_to_zero(v), nan_to_zero(leaving));
+        wsum = wsum + sp * nv - sum;
+        sum = sum + nv - lv;
+        nans += v.is_nan() as usize;
+        nans -= leaving.is_nan() as usize;
+        out[i] = if nans == 0 { wsum / weight_sum } else { f64::NAN };
     }
     out
 }
@@ -222,14 +361,26 @@ pub fn ema_sma(data: &[f64], period: usize) -> Vec<f64> {
     if period == 0 || n < period {
         return r;
     }
+    // Seed on the first NaN-free window rather than blindly on data[..period],
+    // so leading warm-up NaNs from an upstream indicator only delay the start.
+    let fv = match first_clean_window(data, period) {
+        Some(x) => x,
+        None => return r,
+    };
     let alpha = 2.0 / (period as f64 + 1.0);
     let mut s = 0.0;
-    for &x in data.iter().take(period) {
+    for &x in data.iter().skip(fv).take(period) {
         s += x;
     }
-    r[period - 1] = s / period as f64;
-    for i in period..n {
-        r[i] = alpha * data[i] + (1.0 - alpha) * r[i - 1];
+    let start = fv + period - 1;
+    let mut prev = s / period as f64;
+    r[start] = prev;
+    for i in start + 1..n {
+        if data[i].is_nan() {
+            continue;
+        }
+        prev = alpha * data[i] + (1.0 - alpha) * prev;
+        r[i] = prev;
     }
     r
 }
@@ -242,30 +393,25 @@ pub fn ema_wilder(data: &[f64], period: usize) -> Vec<f64> {
     if period == 0 {
         return result;
     }
-    let mut first_valid = 0usize;
-    while first_valid < n && data[first_valid].is_nan() {
-        first_valid += 1;
-    }
-    if first_valid + period > n {
-        return result;
-    }
+    let first_valid = match first_clean_window(data, period) {
+        Some(x) => x,
+        None => return result,
+    };
     let mut sum_val = 0.0;
     for i in first_valid..first_valid + period {
-        if data[i].is_nan() {
-            return result;
-        }
         sum_val += data[i];
     }
     let start = first_valid + period - 1;
     result[start] = sum_val / period as f64;
     let pm1 = (period - 1) as f64;
     let p = period as f64;
+    // Carry the recursion in `prev` and select rather than branch: this loop is a
+    // serial dependency chain, so a mispredict costs more than the extra multiply.
+    let mut prev = result[start];
     for i in start + 1..n {
-        if data[i].is_nan() {
-            result[i] = result[i - 1];
-        } else {
-            result[i] = (result[i - 1] * pm1 + data[i]) / p;
-        }
+        let v = data[i];
+        prev = if v.is_nan() { prev } else { (prev * pm1 + v) / p };
+        result[i] = prev;
     }
     result
 }
@@ -286,7 +432,13 @@ pub fn true_range(high: &[f64], low: &[f64], close: &[f64]) -> Vec<f64> {
         let hl = high[i] - low[i];
         let hc = (high[i] - close[i - 1]).abs();
         let lc = (low[i] - close[i - 1]).abs();
-        tr[i] = max3(hl, hc, lc);
+        // `max3` compares with `>`, which is false against NaN, so a NaN leg can
+        // lose to a finite one and vanish. An unknown bar must stay unknown.
+        tr[i] = if hl.is_nan() || hc.is_nan() || lc.is_nan() {
+            f64::NAN
+        } else {
+            max3(hl, hc, lc)
+        };
     }
     tr
 }
@@ -294,22 +446,14 @@ pub fn true_range(high: &[f64], low: &[f64], close: &[f64]) -> Vec<f64> {
 /// ATR with Wilder smoothing. Seed = simple average of first `period` TRs.
 pub fn atr_wilder(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Vec<f64> {
     let n = high.len();
-    let tr = true_range(high, low, close);
-    let mut atr = nan_vec(n);
     if period == 0 || n < period {
-        return atr;
+        return nan_vec(n);
     }
-    let mut sum_tr = 0.0;
-    for &t in tr.iter().take(period) {
-        sum_tr += t;
-    }
-    atr[period - 1] = sum_tr / period as f64;
-    let pm1 = (period - 1) as f64;
-    let p = period as f64;
-    for i in period..n {
-        atr[i] = (atr[i - 1] * pm1 + tr[i]) / p;
-    }
-    atr
+    // Wilder smoothing of the true range: `ema_wilder` is the same recursion with
+    // the leading-NaN handling already in it, so ATR inherits that rather than
+    // re-seeding blindly at index 0 and poisoning `atr[i - 1]` for the rest of
+    // the series the moment a NaN reaches the true range.
+    ema_wilder(&true_range(high, low, close), period)
 }
 
 /// ATR using a simple moving average of True Range.
@@ -364,23 +508,34 @@ fn _roll_extreme(data: &[f64], period: usize, want_max: bool) -> Vec<f64> {
     let mut ring: Vec<usize> = vec![0usize; cap];
     let mut head = 0usize; // front counter
     let mut tail = 0usize; // back counter (len = tail - head)
+    // Window-local in NaN: every comparison below is false against a NaN, so a NaN
+    // would otherwise sit in the deque undroppable and be reported as the extreme.
+    // NaNs are kept out of the deque entirely and counted instead.
+    let mut nans = 0usize;
     for i in 0..n {
+        if i >= period && data[i - period].is_nan() {
+            nans -= 1;
+        }
         if head < tail && ring[head & mask] + period <= i {
             head += 1;
         }
         let x = data[i];
-        while tail > head {
-            let b = ring[(tail - 1) & mask];
-            let drop = if want_max { data[b] <= x } else { data[b] >= x };
-            if drop {
-                tail -= 1;
-            } else {
-                break;
+        if x.is_nan() {
+            nans += 1;
+        } else {
+            while tail > head {
+                let b = ring[(tail - 1) & mask];
+                let drop = if want_max { data[b] <= x } else { data[b] >= x };
+                if drop {
+                    tail -= 1;
+                } else {
+                    break;
+                }
             }
+            ring[tail & mask] = i;
+            tail += 1;
         }
-        ring[tail & mask] = i;
-        tail += 1;
-        if i + 1 >= period {
+        if i + 1 >= period && nans == 0 {
             result[i] = data[ring[head & mask]];
         }
     }
@@ -408,23 +563,46 @@ pub fn vwma(data: &[f64], volume: &[f64], period: usize) -> Vec<f64> {
     if period == 0 || n < period {
         return result;
     }
+    let bad = |i: usize| data[i].is_nan() || volume[i].is_nan();
     let mut sum_pv = 0.0;
     let mut sum_v = 0.0;
+    let mut nans = 0usize;
     for i in 0..period {
-        sum_pv += data[i] * volume[i];
-        sum_v += volume[i];
+        if bad(i) {
+            nans += 1;
+        } else {
+            sum_pv += data[i] * volume[i];
+            sum_v += volume[i];
+        }
     }
-    result[period - 1] = if sum_v > 0.0 {
-        sum_pv / sum_v
-    } else {
-        data[period - 1]
-    };
+    if nans == 0 {
+        result[period - 1] = if sum_v > 0.0 {
+            sum_pv / sum_v
+        } else {
+            data[period - 1]
+        };
+    }
     for i in period..n {
-        let new_pv = data[i] * volume[i];
-        let old_pv = data[i - period] * volume[i - period];
+        let (new_bad, old_bad) = (bad(i), bad(i - period));
+        let new_v = if new_bad { 0.0 } else { volume[i] };
+        let new_pv = if new_bad { 0.0 } else { data[i] * volume[i] };
+        let old_v = if old_bad { 0.0 } else { volume[i - period] };
+        let old_pv = if old_bad {
+            0.0
+        } else {
+            data[i - period] * volume[i - period]
+        };
         sum_pv = sum_pv + new_pv - old_pv;
-        sum_v = sum_v + volume[i] - volume[i - period];
-        result[i] = if sum_v > 0.0 { sum_pv / sum_v } else { data[i] };
+        sum_v = sum_v + new_v - old_v;
+        nans += new_bad as usize;
+        nans -= old_bad as usize;
+        result[i] = if nans != 0 {
+            f64::NAN
+        } else if sum_v > 0.0 {
+            sum_pv / sum_v
+        } else {
+            data[i]
+        };
     }
     result
 }
@@ -971,11 +1149,19 @@ pub fn rsi(data: &[f64], period: usize) -> Vec<f64> {
     if period == 0 || n < period + 1 {
         return result;
     }
+    // Seed on the first NaN-free run of period+1 values (= period deltas). A NaN
+    // delta is neither > 0 nor < 0, so seeding blindly at index 0 used to fold an
+    // upstream indicator's warm-up into avg_gain == avg_loss == 0 and publish the
+    // avg_loss == 0 branch: a confident, wrong RSI of 100 over the whole prefix.
+    let fv = match first_clean_window(data, period + 1) {
+        Some(x) => x,
+        None => return result,
+    };
     let p = period as f64;
     let pm1 = (period - 1) as f64;
     let mut avg_gain = 0.0;
     let mut avg_loss = 0.0;
-    for i in 0..period {
+    for i in fv..fv + period {
         let d = data[i + 1] - data[i];
         if d > 0.0 {
             avg_gain += d;
@@ -985,13 +1171,18 @@ pub fn rsi(data: &[f64], period: usize) -> Vec<f64> {
     }
     avg_gain /= p;
     avg_loss /= p;
-    result[period] = if avg_loss == 0.0 {
+    let start = fv + period;
+    result[start] = if avg_loss == 0.0 {
         100.0
     } else {
         100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
     };
-    for i in period..n - 1 {
+    for i in start..n - 1 {
         let d = data[i + 1] - data[i];
+        if d.is_nan() {
+            // Bar is unknown, not flat: leave NaN and keep the averages intact.
+            continue;
+        }
         let gain = if d > 0.0 { d } else { 0.0 };
         let loss = if d < 0.0 { -d } else { 0.0 };
         avg_gain = (avg_gain * pm1 + gain) / p;
@@ -1338,9 +1529,13 @@ pub fn ema_first_valid(data: &[f64], period: usize) -> Vec<f64> {
         Some(x) => x,
         None => return r,
     };
+    // Carry the recursion in `prev`, not in `r[i - 1]`: an interior NaN leaves a
+    // NaN in `r` and reading it back would poison every later bar.
+    let mut prev = r[fv];
     for i in fv + 1..n {
         if !data[i].is_nan() {
-            r[i] = alpha * data[i] + (1.0 - alpha) * r[i - 1];
+            prev = alpha * data[i] + (1.0 - alpha) * prev;
+            r[i] = prev;
         }
     }
     r
@@ -2020,8 +2215,15 @@ pub fn median(data: &[f64], period: usize) -> Vec<f64> {
     }
     let mut buf = vec![0.0f64; period];
     for i in period - 1..n {
-        buf.copy_from_slice(&data[i + 1 - period..i + 1]);
-        buf.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let w = &data[i + 1 - period..i + 1];
+        if w.iter().any(|x| x.is_nan()) {
+            // Window-local, and NaN has no total order: `partial_cmp` returns None
+            // for it, so sorting a window that contains one used to panic straight
+            // through the PyO3 boundary (a BaseException, not a catchable error).
+            continue;
+        }
+        buf.copy_from_slice(w);
+        buf.sort_by(f64::total_cmp);
         out[i] = if period % 2 == 1 {
             buf[period / 2]
         } else {
@@ -3102,5 +3304,200 @@ mod tests {
         let r = vwma(&d, &v, 2);
         approx(r[1], 20.0);
         approx(r[2], 30.0);
+    }
+
+    // ------------------------------------------------------------------
+    // NaN contract (issue #2029)
+    //
+    // Rolling-window kernels are window-local: output[i] is NaN iff i < period-1
+    // or the window [i-period+1 ..= i] contains a NaN, and the series recovers
+    // once the NaN slides out. Recursive kernels skip leading NaNs, seed at the
+    // first finite value, and carry their state across an interior NaN.
+    // ------------------------------------------------------------------
+
+    /// 1.0 ..= 40.0 with NaN punched in at `holes`.
+    fn ramp_with_nan(holes: &[usize]) -> Vec<f64> {
+        let mut d: Vec<f64> = (1..=40).map(|x| x as f64).collect();
+        for &h in holes {
+            d[h] = f64::NAN;
+        }
+        d
+    }
+
+    fn nan_count(v: &[f64]) -> usize {
+        v.iter().filter(|x| x.is_nan()).count()
+    }
+
+    /// Indices whose `period`-wide window contains one of `holes`, plus warm-up.
+    fn expected_nan_idx(n: usize, period: usize, holes: &[usize]) -> Vec<usize> {
+        (0..n)
+            .filter(|&i| {
+                i + 1 < period
+                    || holes
+                        .iter()
+                        .any(|&h| h + period > i && h <= i)
+            })
+            .collect()
+    }
+
+    fn assert_window_local(out: &[f64], period: usize, holes: &[usize]) {
+        let want = expected_nan_idx(out.len(), period, holes);
+        let got: Vec<usize> = (0..out.len()).filter(|&i| out[i].is_nan()).collect();
+        assert_eq!(got, want, "NaN positions differ");
+    }
+
+    #[test]
+    fn sma_nan_is_window_local() {
+        for holes in [vec![0usize], vec![0, 1, 2], vec![20]] {
+            let d = ramp_with_nan(&holes);
+            assert_window_local(&sma(&d, 9), 9, &holes);
+        }
+        // Values after recovery match the clean series exactly.
+        let clean = ramp_with_nan(&[]);
+        let holed = ramp_with_nan(&[20]);
+        approx(sma(&holed, 9)[29], sma(&clean, 9)[29]);
+    }
+
+    #[test]
+    fn wma_nan_is_window_local() {
+        for holes in [vec![0usize], vec![0, 1, 2], vec![20]] {
+            let d = ramp_with_nan(&holes);
+            assert_window_local(&wma(&d, 9), 9, &holes);
+        }
+        let clean = ramp_with_nan(&[]);
+        let holed = ramp_with_nan(&[20]);
+        approx(wma(&holed, 9)[29], wma(&clean, 9)[29]);
+    }
+
+    #[test]
+    fn rolling_sum_nan_is_window_local() {
+        let holes = [20usize];
+        let d = ramp_with_nan(&holes);
+        assert_window_local(&rolling_sum(&d, 9), 9, &holes);
+        approx(rolling_sum(&d, 9)[29], rolling_sum(&ramp_with_nan(&[]), 9)[29]);
+    }
+
+    #[test]
+    fn stdev_nan_is_window_local_not_zero() {
+        // Regression: `NaN.max(0.0)` returns 0.0 in Rust, so a poisoned accumulator
+        // silently produced 0.0 for the rest of the series instead of NaN.
+        let holes = [0usize];
+        let d = ramp_with_nan(&holes);
+        let r = stdev(&d, 9);
+        assert_window_local(&r, 9, &holes);
+        approx(r[9], stdev(&ramp_with_nan(&[]), 9)[9]);
+        assert!(r[9] > 0.0, "stdev collapsed to {}", r[9]);
+    }
+
+    #[test]
+    fn rolling_variance_nan_is_window_local() {
+        let holes = [20usize];
+        let d = ramp_with_nan(&holes);
+        assert_window_local(&rolling_variance(&d, 9), 9, &holes);
+    }
+
+    #[test]
+    fn vwma_nan_is_window_local() {
+        let holes = [20usize];
+        let d = ramp_with_nan(&holes);
+        let v = vec![100.0f64; 40];
+        assert_window_local(&vwma(&d, &v, 9), 9, &holes);
+        // A NaN in the volume leg is window-local too.
+        let mut v2 = vec![100.0f64; 40];
+        v2[5] = f64::NAN;
+        assert_window_local(&vwma(&ramp_with_nan(&[]), &v2, 9), 9, &[5]);
+    }
+
+    #[test]
+    fn hma_nan_is_window_local() {
+        // HMA(9) = WMA(2*WMA(.,4) - WMA(.,9), 3): first valid at (9-1)+(3-1) = 10,
+        // and a hole at h blanks every output whose combined window touches it.
+        let d = ramp_with_nan(&[0]);
+        let r = hma(&d, 9);
+        assert_eq!(nan_count(&r), 11);
+        assert!(!r[11].is_nan());
+        approx(r[20], hma(&ramp_with_nan(&[]), 9)[20]);
+    }
+
+    #[test]
+    fn ema_skips_leading_nan_and_survives_a_hole() {
+        let d = ramp_with_nan(&[0, 1, 2]);
+        let r = ema(&d, 9);
+        assert!(r[0].is_nan() && r[1].is_nan() && r[2].is_nan());
+        approx(r[3], 4.0); // seeded with the first finite value
+        assert_eq!(nan_count(&r), 3);
+
+        let mid = ramp_with_nan(&[20]);
+        let rm = ema(&mid, 9);
+        assert_eq!(nan_count(&rm), 1, "an interior NaN must not poison the state");
+        assert!(rm[20].is_nan() && !rm[21].is_nan());
+    }
+
+    #[test]
+    fn ema_sma_skips_leading_nan() {
+        let d = ramp_with_nan(&[0, 1, 2]);
+        let r = ema_sma(&d, 9);
+        // Seed is the SMA of data[3..12], first output at index 11.
+        assert_eq!(nan_count(&r), 11);
+        approx(r[11], (4..=12).map(|x| x as f64).sum::<f64>() / 9.0);
+    }
+
+    #[test]
+    fn ema_first_valid_survives_an_interior_nan() {
+        let d = ramp_with_nan(&[20]);
+        let r = ema_first_valid(&d, 9);
+        assert_eq!(nan_count(&r), 1);
+        assert!(r[20].is_nan() && !r[21].is_nan());
+    }
+
+    #[test]
+    fn chained_indicators_produce_signal() {
+        // The reported reproduction: wma -> rsi -> wma must not blank out.
+        let n = 400;
+        let src: Vec<f64> = (0..n)
+            .map(|i| 100.0 + 10.0 * ((i as f64) / 7.0).sin() + (i as f64) * 0.01)
+            .collect();
+        let base = wma(&src, 55);
+        let r = rsi(&base, 14);
+        let avg = wma(&r, 9);
+        let crossings = (1..n)
+            .filter(|&i| {
+                let (a0, b0, a1, b1) = (r[i - 1], avg[i - 1], r[i], avg[i]);
+                a0.is_finite() && b0.is_finite() && a1.is_finite() && b1.is_finite()
+                    && a0 <= b0 && a1 > b1
+            })
+            .count();
+        assert!(crossings > 0, "expected crossovers, found none");
+    }
+
+    #[test]
+    fn rsi_skips_upstream_warmup_instead_of_printing_100() {
+        // A NaN delta is neither a gain nor a loss, so the old seeding turned an
+        // upstream indicator's warm-up into avg_loss == 0 -> a flat RSI of 100.
+        let mut d: Vec<f64> = (1..=100).map(|x| x as f64).collect();
+        for v in d.iter_mut().take(20) {
+            *v = f64::NAN;
+        }
+        let r = rsi(&d, 14);
+        for (i, v) in r.iter().enumerate().take(34) {
+            assert!(v.is_nan(), "rsi[{i}] = {v}, expected NaN inside the warm-up");
+        }
+        assert!(!r[34].is_nan());
+        // Seeded at the first clean window, it matches the same slice run alone.
+        let tail: Vec<f64> = d[20..].to_vec();
+        approx(r[34], rsi(&tail, 14)[14]);
+    }
+
+    #[test]
+    fn median_window_with_nan_is_nan_not_a_panic() {
+        let mut d: Vec<f64> = (1..=30).map(|x| x as f64).collect();
+        d[5] = f64::NAN;
+        let r = median(&d, 5);
+        // Warm-up 0..=3, then the five windows that span the hole at index 5.
+        for i in (0..4).chain(5..10) {
+            assert!(r[i].is_nan(), "median[{i}] = {}", r[i]);
+        }
+        approx(r[4], 3.0);
+        approx(r[10], 9.0);
     }
 }

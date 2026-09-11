@@ -9,6 +9,43 @@ A Python library for algorithmic trading using OpenAlgo's REST APIs and WebSocke
 - General Documentation: https://docs.openalgo.in
 - Source: https://github.com/marketcalls/openalgo-python-library
 
+## What's New in 2.0.5
+
+**Bug-fix release: NaN handling in the indicator kernels.** Chaining one indicator
+into another was silently producing nothing, because every indicator emits warm-up
+NaNs and the moving-average kernels let a single NaN poison their running
+accumulator for the rest of the series ([#2029]).
+
+```python
+df["RSI_wma"] = ta.rsi(ta.wma(df["close"], 55), 14)
+df["RSI_avg"] = ta.wma(df["RSI_wma"], 9)      # was: NaN on every row
+ta.crossover(df["RSI_wma"], df["RSI_avg"]).sum()   # was: 0 across 1600 bars
+```
+
+Three of these failed silently with plausible numbers rather than NaN:
+
+- **`stdev` returned `0.0`**, not NaN, for the rest of the series after a NaN
+  (`f64::max` yields the *other* operand against NaN), collapsing Bollinger width.
+- **`rsi` returned a flat `100`** over an upstream indicator's warm-up: a NaN delta
+  is neither a gain nor a loss, so `avg_loss` seeded to 0 and took the
+  "no losses" branch.
+- **`median` panicked** through the PyO3 boundary on any window containing a NaN.
+
+`ta.crossover` / `ta.crossunder` were never at fault and are unchanged.
+
+**The NaN contract is now stated and enforced on both backends.** Rolling-window
+kernels are *window-local*: a NaN blanks only the windows containing it and the
+series recovers once it slides out, the same rule as pandas `.rolling(period)`.
+Recursive kernels (the EMA family) skip leading NaNs and seed at the first finite
+value. The Rust core and the pure-NumPy fallback had drifted apart here, so the
+same script gave different answers from a wheel and from a source checkout; they
+are now checked against each other in CI.
+
+`ta.vi` and `ta.ulcerindex` returned all-NaN on clean OHLCV and now produce values.
+For NaN-free input every other indicator is unchanged, bit for bit.
+
+[#2029]: https://github.com/marketcalls/openalgo/issues/2029
+
 ## What's New in 2.0.4
 
 - **GTT (Good Till Triggered) orders**: `placegttorder`, `modifygttorder`,
