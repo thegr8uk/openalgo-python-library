@@ -16,6 +16,7 @@ from .telegram import TelegramAPI
 from .whatsapp import WhatsAppAPI
 from .utilities import UtilitiesAPI
 from .indicators import ta
+from .reports import ReportsAPI
 
 # ------------------------------------------------------------------
 # Indicator math runs in the Rust core (openalgo._oaindicators); numba/llvmlite
@@ -28,7 +29,7 @@ nbjit = _jit_shim
 prange = _prange
 
 class api(OrderAPI, GTTAPI, DataAPI, AccountAPI, FeedAPI, OptionsAPI,
-          StrategyAPI, TelegramAPI, WhatsAppAPI, UtilitiesAPI):
+          StrategyAPI, TelegramAPI, WhatsAppAPI, UtilitiesAPI, ReportsAPI):
     """
     OpenAlgo API client class
     """
@@ -55,6 +56,9 @@ class api(OrderAPI, GTTAPI, DataAPI, AccountAPI, FeedAPI, OptionsAPI,
         """
         # Initialize BaseAPI for REST functionality
         BaseAPI.__init__(self, api_key, host, version, timeout)
+
+        # Initialize Trade Reporting Service API
+        ReportsAPI.__init__(self)
 
         # Initialize FeedAPI WebSocket attributes
         self.verbose = int(verbose) if verbose is not False else 0
@@ -111,4 +115,4 @@ class api(OrderAPI, GTTAPI, DataAPI, AccountAPI, FeedAPI, OptionsAPI,
 __version__ = "2.0.5"
 
 # Export main components for easy access
-__all__ = ['api', 'Strategy', 'ta', 'nbjit', 'prange', 'HAS_NUMBA']
+__all__ = ['api', 'Strategy', 'ta', 'nbjit', 'prange', 'HAS_NUMBA', 'ReportsAPI']
